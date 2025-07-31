@@ -36,10 +36,10 @@ class AudioConfig:
 @dataclass
 class VADConfig:
     """Voice Activity Detection configuration"""
-    aggressiveness: int = 2          # 0-3, higher = more aggressive filtering
+    aggressiveness: int = 3          # 0-3, higher = more aggressive filtering
     min_voice_duration: float = 0.3  # Minimum voice duration to trigger (seconds)
     max_silence_duration: float = 1.5 # Max silence before ending voice session (seconds)
-    voice_start_threshold: int = 3    # Consecutive voice frames to start
+    voice_start_threshold: int = 5    # Consecutive voice frames to start
     voice_end_threshold: int = 10     # Consecutive silence frames to end
 
 

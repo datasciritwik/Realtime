@@ -8,7 +8,7 @@ from src.config.run import AudioConfig, VADConfig, VoiceState, ConversationState
 from src.text.run import ParallelOpenAIHandler
 
 class WebRTCVADProcessor:
-    """WebRTC Voice Activity Detection with smart buffering"""
+    """WebRTC Voice Activity Detection with smart buffering and output interference prevention"""
     
     def __init__(self, audio_config: AudioConfig, vad_config: VADConfig):
         self.audio_config = audio_config
@@ -23,12 +23,18 @@ class WebRTCVADProcessor:
         self.silence_frames = 0
         
         # Audio buffering for voice sessions
-        self.voice_buffer = deque(maxlen=1000)  # Buffer for voice data
-        self.pre_voice_buffer = deque(maxlen=10)  # Small buffer before voice starts
+        self.voice_buffer = deque(maxlen=1000)
+        self.pre_voice_buffer = deque(maxlen=10)
         
         # Timing
         self.frame_duration = self.audio_config.chunk_size / self.audio_config.sample_rate
         self.voice_start_time = None
+        
+        # Audio output interference prevention
+        self.is_output_playing = False
+        self.output_end_time = None
+        self.output_cooldown = 0.5  # seconds to wait after output stops
+        self.adaptive_threshold_multiplier = 1.0
         
         # Callbacks
         self.on_voice_start: Optional[Callable[[], None]] = None
@@ -46,15 +52,57 @@ class WebRTCVADProcessor:
         self.on_voice_data = on_voice_data
         self.on_voice_end = on_voice_end
     
+    def set_output_state(self, is_playing: bool):
+        """Notify VAD about audio output state"""
+        self.is_output_playing = is_playing
+        if not is_playing:
+            self.output_end_time = time.time()
+            logger.info("🔇 Audio output stopped, enabling VAD cooldown")
+        else:
+            logger.info("🔊 Audio output started, suppressing VAD")
+    
+    def _is_in_output_cooldown(self) -> bool:
+        """Check if we're in output cooldown period"""
+        if self.output_end_time is None:
+            return False
+        return (time.time() - self.output_end_time) < self.output_cooldown
+    
+    def _should_process_vad(self) -> bool:
+        """Determine if VAD should process current frame"""
+        # Don't process during output playback
+        if self.is_output_playing:
+            return False
+        
+        # Don't process during cooldown period
+        if self._is_in_output_cooldown():
+            return False
+        
+        return True
+    
     def process_audio_frame(self, audio_data: bytes) -> VoiceState:
-        """Process single audio frame through VAD"""
+        """Process single audio frame through VAD with output interference prevention"""
         try:
             # WebRTC VAD requires specific frame size
-            if len(audio_data) != self.audio_config.chunk_size * 2:  # 2 bytes per sample for int16
+            if len(audio_data) != self.audio_config.chunk_size * 2:
                 return self.voice_state
             
-            # Run VAD detection
+            # Skip VAD processing during output playback or cooldown
+            if not self._should_process_vad():
+                # Reset voice state if we were detecting voice
+                if self.voice_state != VoiceState.SILENCE:
+                    logger.info("🔇 Resetting VAD state due to output interference")
+                    self._reset_voice_detection()
+                return VoiceState.SILENCE
+            
+            # Run VAD detection with adaptive thresholding
             is_speech = self.vad.is_speech(audio_data, self.audio_config.sample_rate)
+            
+            # Apply adaptive thresholding based on recent output
+            if self.output_end_time and (time.time() - self.output_end_time) < 2.0:
+                # Be more conservative right after output
+                required_voice_frames = int(self.vad_config.voice_start_threshold * 1.5)
+            else:
+                required_voice_frames = self.vad_config.voice_start_threshold
             
             if is_speech:
                 self.voice_frames += 1
@@ -63,9 +111,9 @@ class WebRTCVADProcessor:
                 # Always buffer current frame when speech is detected
                 self.voice_buffer.append(audio_data)
                 
-                # Check for voice start
+                # Check for voice start with adaptive threshold
                 if (self.voice_state == VoiceState.SILENCE and 
-                    self.voice_frames >= self.vad_config.voice_start_threshold):
+                    self.voice_frames >= required_voice_frames):
                     
                     self._start_voice_session()
                 
@@ -95,6 +143,14 @@ class WebRTCVADProcessor:
         except Exception as e:
             logger.error(f"VAD processing error: {e}")
             return self.voice_state
+    
+    def _reset_voice_detection(self):
+        """Reset voice detection state"""
+        self.voice_state = VoiceState.SILENCE
+        self.voice_frames = 0
+        self.silence_frames = 0
+        self.voice_buffer.clear()
+        self.voice_start_time = None
     
     def _start_voice_session(self):
         """Start a new voice session"""
@@ -129,24 +185,17 @@ class WebRTCVADProcessor:
                 logger.info("🎤 Voice too short, ignoring")
         
         # Reset state
-        self.voice_state = VoiceState.SILENCE
-        self.voice_buffer.clear()
-        self.voice_start_time = None
-        self.voice_frames = 0
-        self.silence_frames = 0
+        self._reset_voice_detection()
     
     def reset(self):
         """Reset VAD state"""
-        self.voice_state = VoiceState.SILENCE
-        self.voice_frames = 0
-        self.silence_frames = 0
-        self.voice_buffer.clear()
+        self._reset_voice_detection()
         self.pre_voice_buffer.clear()
-        self.voice_start_time = None
-        
-    
+        self.output_end_time = None
+
+
 class ParallelStreamingSpeechConversation:
-    """Main class for true parallel streaming conversations with VAD"""
+    """Enhanced conversation class with output interference prevention"""
     
     def __init__(
         self,
@@ -174,15 +223,16 @@ class ParallelStreamingSpeechConversation:
         # Response tracking
         self.current_response_text = ""
         self.response_sequence = 0
+        self.is_generating_audio = False
         
         # Callbacks for parallel streams
         self.on_transcription: Optional[Callable[[str], None]] = None
-        self.on_text_chunk: Optional[Callable[[str], None]] = None  # Real-time text
-        self.on_text_complete: Optional[Callable[[str], None]] = None  # Complete text
-        self.on_audio_chunk: Optional[Callable[[bytes], None]] = None  # Real-time audio
-        self.on_audio_complete: Optional[Callable[[], None]] = None  # Audio finished
+        self.on_text_chunk: Optional[Callable[[str], None]] = None
+        self.on_text_complete: Optional[Callable[[str], None]] = None
+        self.on_audio_chunk: Optional[Callable[[bytes], None]] = None
+        self.on_audio_complete: Optional[Callable[[], None]] = None
         self.on_state_change: Optional[Callable[[ConversationState], None]] = None
-        self.on_voice_activity: Optional[Callable[[bool], None]] = None  # Voice start/stop
+        self.on_voice_activity: Optional[Callable[[bool], None]] = None
         
         # Control
         self.is_running = False
@@ -191,28 +241,31 @@ class ParallelStreamingSpeechConversation:
         self._setup_vad_callbacks()
         
     def _setup_vad_callbacks(self):
-        """Setup VAD event callbacks"""
+        """Setup VAD event callbacks with output state management"""
         def on_voice_start():
-            self._change_state(ConversationState.VOICE_DETECTED)
-            self.current_voice_session = []
-            if self.on_voice_activity:
-                self.on_voice_activity(True)
+            # Only process if we're not generating audio
+            if not self.is_generating_audio:
+                self._change_state(ConversationState.VOICE_DETECTED)
+                self.current_voice_session = []
+                if self.on_voice_activity:
+                    self.on_voice_activity(True)
         
         def on_voice_data(audio_data: bytes):
-            self.current_voice_session.append(audio_data)
+            if not self.is_generating_audio:
+                self.current_voice_session.append(audio_data)
         
         def on_voice_end():
-            if self.current_voice_session:
+            if self.current_voice_session and not self.is_generating_audio:
                 # Queue complete voice session for transcription
                 try:
                     self.voice_session_queue.put_nowait(self.current_voice_session.copy())
                 except asyncio.QueueFull:
                     logger.warning("Voice session queue full")
-            
-            self.current_voice_session = []
-            self._change_state(ConversationState.LISTENING)
-            if self.on_voice_activity:
-                self.on_voice_activity(False)
+                
+                self.current_voice_session = []
+                self._change_state(ConversationState.LISTENING)
+                if self.on_voice_activity:
+                    self.on_voice_activity(False)
         
         self.audio_processor.set_vad_callbacks(on_voice_start, on_voice_data, on_voice_end)
     
@@ -249,7 +302,11 @@ class ParallelStreamingSpeechConversation:
         self.current_response_text += text_chunk
     
     def _audio_chunk_callback(self, audio_data: bytes):
-        """Callback for audio chunks (immediate playback)"""
+        """Callback for audio chunks with VAD state management"""
+        # Notify VAD that audio output is active
+        self.audio_processor.vad_processor.set_output_state(True)
+        self.is_generating_audio = True
+        
         # Queue audio for immediate playback
         self.audio_processor.queue_audio(audio_data)
         
@@ -298,6 +355,7 @@ class ParallelStreamingSpeechConversation:
             # Reset current response
             self.current_response_text = ""
             self.response_sequence += 1
+            self.is_generating_audio = True
             
             # Generate parallel response (text and audio streams independently)
             complete_response = await self.openai_handler.generate_parallel_response(
@@ -317,6 +375,11 @@ class ParallelStreamingSpeechConversation:
             if self.on_text_complete:
                 self.on_text_complete(self.current_response_text)
             
+            # Wait a moment for audio queue to finish, then notify VAD
+            await asyncio.sleep(0.5)
+            self.audio_processor.vad_processor.set_output_state(False)
+            self.is_generating_audio = False
+            
             if self.on_audio_complete:
                 self.on_audio_complete()
             
@@ -324,11 +387,13 @@ class ParallelStreamingSpeechConversation:
             
         except Exception as e:
             logger.error(f"Response processing error: {e}")
+            self.is_generating_audio = False
+            self.audio_processor.vad_processor.set_output_state(False)
             self._change_state(ConversationState.LISTENING)
     
     async def start_conversation(self):
-        """Start parallel streaming conversation with VAD"""
-        logger.info("Starting VAD-enabled parallel streaming conversation...")
+        """Start parallel streaming conversation with enhanced VAD"""
+        logger.info("Starting VAD-enabled parallel streaming conversation with output management...")
         self.is_running = True
         self._change_state(ConversationState.LISTENING)
         
@@ -365,5 +430,3 @@ class ParallelStreamingSpeechConversation:
     def get_conversation_context(self) -> list:
         """Get conversation context"""
         return self.conversation_context.copy()
-  
-        
